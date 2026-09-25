@@ -1,0 +1,49 @@
+# Onboard decision computer for the simulated drone.
+#
+#   simulator process (host: run.py, MuJoCo, perception, guidance, pilot)
+#          |  http://localhost:8000/v1/systemone   (loopback only)
+#          v
+#   laya-onboard container  (CUDA, 6 CPUs, 8 GB, batch 1)  == "jetson_orin_nano_like"
+#
+# First start downloads the checkpoint into the `laya-hf-cache` volume. After that
+# the service runs with no network at all:  OFFLINE=true docker compose ... up -d
+#
+#   docker compose -f docker-compose.onboard.yml up -d --build
+#   docker compose -f docker-compose.onboard.yml logs -f laya
+name: jev-drone-onboard
+
+services:
+  laya:
+    build:
+      context: ../docker-laya
+      dockerfile: Dockerfile.cuda
+    image: laya-api:cuda
+    container_name: laya-onboard
+    environment:
+      DEVICE: cuda
+      MODELS: ${LAYA_MODELS:-english}
+      API_KEYS: ""                      # loopback-only service; no auth on the onboard bus
+      HF_HOME: /data/hf
+      HF_HUB_OFFLINE: ${OFFLINE:-false}
+      TRANSFORMERS_OFFLINE: ${OFFLINE:-false}
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      OMP_NUM_THREADS: "6"              # match the CPU envelope
+    ports:
+      - "127.0.0.1:8000:8000"           # reachable from this machine only, never from the LAN
+    volumes:
+      - laya-hf-cache:/data/hf
+    deploy:
+      resources:
+        limits:
+          cpus: "6"
+          memory: 8G
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    memswap_limit: 8G                   # no swap beyond the 8 GB envelope
+    restart: unless-stopped
+
+volumes:
+  laya-hf-cache:

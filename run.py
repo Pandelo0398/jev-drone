@@ -10,6 +10,7 @@ import os, sys, json, time, argparse
 import numpy as np
 import mujoco
 import flight
+import safety
 from tactics import THRESHOLDS as THRESH, decision_needed
 
 STANDOFF = 3.5
@@ -19,13 +20,17 @@ CRUISE_ALT = 1.6
 CHASE_FOVY = 50.0        # cinematic lens for the third-person render
 CLIMB_ALT = 3.0          # beams top out at 2.1; this clears them with margin
 CLIMB_HOLD_STEPS = 90    # ~1.8 s at 50 Hz guidance
-REFLEX_M = 2.2           # code-owned: below this, Jev's opinion is irrelevant
+REFLEX_M = safety.REFLEX_M   # code-owned: below this, the model's opinion is irrelevant
 TRACE = bool(os.environ.get("TRACE"))
 
 
 ROVER_SPEED = 1.15
 SEARCH_SPEED = 2.4
 TARGET_MAX_SPEED = 1.6   # the rover cannot move faster than this; clamp the estimate       # while searching, still out-pace the rover
+
+
+# x past which each station counts as cleared: slalom, beam0, turnstiles, gate, beam1+cluster
+STATIONS_X = (("slalom", 13.5), ("beam0", 19.8), ("turnstiles", 31.5), ("gate", 38.5), ("cluster", 58.5))
 
 
 def rover_pose(t):
@@ -73,7 +78,10 @@ class Guidance:
         self.lost_for = 0.0
         self.climb_hold = 0
         self.commit = None
+        self.commit_id = None
         self.commit_left = 0
+        self.veto = None         # safety-gate veto on this tick, and whose decision it hit
+        self.veto_id = None
         self.search_yaw = None
         # world-frame estimate of the target, built from our own pose + the camera
         # bearing/range. No ground truth; this is what the aircraft could work out.
@@ -158,21 +166,26 @@ class Guidance:
             slide = side * 2.6 * urgency * min(1.0, room / 4.0)
             fwd *= 1.0 - 0.7 * urgency
 
-        # --- Jev's tactical commitment (advisory) --------------------------------
+        # --- the model's tactical commitment (advisory) ---------------------------
         acted = False
-        if (use_jev and judg["source"] == "jev" and judg["age_s"] < THRESH["stale_after_s"]
-                and (decision_needed(scene) or self.climb_hold)):
+        self.veto = self.veto_id = None
+        usable = use_jev and safety.judgment_usable(judg, THRESH["stale_after_s"])[0]
+        if usable and (decision_needed(scene) or self.climb_hold):
             self.commit_left = max(0, self.commit_left - 1)
             if self.commit_left == 0 or judg["risk"] >= THRESH["override_risk"]:
                 if judg["maneuver"] != self.commit:
                     self.commit, self.commit_left = judg["maneuver"], THRESH["commit_steps"]
+                    self.commit_id = judg.get("decision_id")
             mv = self.commit
             if not decision_needed(scene):
                 mv = "hold_course"                 # the way is clear; stop maneuvering
-                self.commit, self.commit_left = None, 0
+                self.commit, self.commit_left, self.commit_id = None, 0, None
             if judg["target_truly_lost"] >= THRESH["really_lost"] and mv != "climb":
                 mv = "reacquire"
             acted = True
+            climb_ok, climb_why = safety.climb_allowed(scene) if mv == "climb" else (True, None)
+            if not climb_ok:
+                self.veto, self.veto_id = climb_why, self.commit_id
 
             if mv in ("gap_left", "gap_right"):
                 left = mv == "gap_left"
@@ -182,8 +195,8 @@ class Guidance:
                     yaw_rel = self._open_side(sec, left)
                 fwd = max(fwd, 0.7)
             # only commit to going over it if there is demonstrably clear air up there
-            elif (mv == "climb" and scene["sectors_blocked"] >= 4
-                  and scene["free_ahead_above_m"] > 2.2 * scene["free_ahead_level_m"]):
+            # (safety gate; a vetoed climb falls through to hold_course, as it always did)
+            elif mv == "climb" and climb_ok:
                 self.climb_hold = THRESH["climb_steps"]
                 alt_sp = CLIMB_ALT
                 fwd, slide, turn_bias = min(fwd, 0.5), 0.0, 0.0
@@ -211,7 +224,9 @@ class Guidance:
         # --- hard reflex: code overrides everything, Jev included ------------------
         # Reflex on what is in the path, not on what is merely alongside.
         near, nb = scene["path_ahead_m"], np.deg2rad(scene["nearest_bearing_deg"])
-        reflex = near < REFLEX_M
+        reflex = safety.reflex_engaged(scene)
+        if reflex and acted and self.veto is None:
+            self.veto, self.veto_id = "reflex_override", self.commit_id
         if reflex:
             side = 1.0 if left_room > right_room else -1.0
             slide = side * 2.6 * min(1.0, max(left_room, right_room) / 3.0)
@@ -234,7 +249,46 @@ class Guidance:
         return v_world, yaw_cmd, acted, reflex
 
 
-def episode(seed=0, seconds=35.0, use_jev=True, video=None, hz=None, budget=None, realtime=True):
+def make_tactician(provider_name, profile, hz, budget):
+    """Build the decision provider + Tactician for a model-in-the-loop run."""
+    import edge
+    from providers import make_provider
+    from tactics import Tactician
+    prof = profile or {}
+    if provider_name != "laya" and edge.local_only(prof):
+        raise SystemExit(f"network_mode=local_only / OFFLINE: {provider_name!r} is a cloud provider; "
+                         "only the onboard Laya service is allowed.")
+    kw = {}
+    if provider_name == "laya":
+        kw = {k: v for k, v in (("url", prof.get("laya_url")), ("model", prof.get("laya_model"))) if v}
+    provider = make_provider(provider_name, **kw)
+    edge.enforce_network(prof, provider)
+    if provider_name == "laya":
+        try:
+            h = provider.health()
+        except Exception as e:
+            raise SystemExit(f"Laya not reachable at {provider.url} ({type(e).__name__}). "
+                             "Start it: docker compose -f docker-compose.onboard.yml up -d")
+        if h.get("device") != "cuda":
+            print(f"[laya] WARNING: service reports device={h.get('device')!r}, not cuda", flush=True)
+        from tactics import QUESTIONS, build_state
+        empty = {"sector_range_m": {k: 25.0 for k in flight.Eye.SECTOR_NAMES}, "sectors_blocked": 0,
+                 "path_ahead_m": 25.0, "free_ahead_above_m": 25.0, "free_ahead_level_m": 25.0,
+                 "nearest_obstacle_m": 25.0, "nearest_bearing_deg": 0.0,
+                 "target": {"visible": False, "bearing_deg": None, "range_m": None, "pixels": 0,
+                            "unseen_for_s": None}}
+        provider.warmup(build_state(empty), QUESTIONS)     # pre-flight: CUDA init on the ground
+    if profile:
+        hz = hz or prof.get("decision_hz")
+        budget = budget or prof.get("inference_budget")
+        deadline = prof.get("max_decision_latency_ms")
+        return Tactician(provider, hz=hz or THRESH["call_hz"], budget=budget,
+                         deadline_s=deadline / 1000.0 if deadline else None)
+    return Tactician(provider, **{k: v for k, v in (("hz", hz), ("budget", budget)) if v})
+
+
+def episode(seed=0, seconds=35.0, use_jev=True, video=None, hz=None, budget=None, realtime=True,
+            provider="laya", profile=None, log_dir=None, gpu_idle_mb=None):
     rng = np.random.default_rng(seed)
     m = mujoco.MjModel.from_xml_path("world.xml")
     d = mujoco.MjData(m)
@@ -249,14 +303,18 @@ def episode(seed=0, seconds=35.0, use_jev=True, video=None, hz=None, budget=None
     pilot = flight.Pilot(m)
     eye = flight.Eye(m)
     guide = Guidance(eye)
-    tac = None
+    tac = monitor = None
     if use_jev:
-        from tactics import Tactician, DEFAULT
-        tac = Tactician(**{k: v for k, v in (("hz", hz), ("budget", budget)) if v})
+        from tactics import DEFAULT
+        tac = make_tactician(provider, profile, hz, budget)
         judg = dict(DEFAULT)
+        if profile and profile.get("container"):
+            import edge
+            monitor = edge.ResourceMonitor(profile["container"], gpu_idle_mb=gpu_idle_mb).start()
     else:
         judg = {"maneuver": "hold_course", "risk": 0.0, "confidence": 0.0,
-                "target_truly_lost": 0.0, "source": "off", "age_s": 0.0, "probabilities": {}}
+                "target_truly_lost": 0.0, "source": "off", "age_s": 0.0, "probabilities": {},
+                "from_model": False, "decision_id": None}
 
     writer = cam = big = None
     if video:
@@ -286,6 +344,8 @@ def episode(seed=0, seconds=35.0, use_jev=True, video=None, hz=None, budget=None
             if lag > 0.0005:
                 time.sleep(lag)
         drive_course(m, d, t)
+        if tac:
+            tac.now = t                                  # sim clock for decision timestamps
 
         pos = d.qpos[:3].copy()
         quat = d.qpos[3:7]
@@ -304,6 +364,7 @@ def episode(seed=0, seconds=35.0, use_jev=True, video=None, hz=None, budget=None
             if tac:
                 prev = judg.get("maneuver"), judg.get("source")
                 judg = tac.read(t)
+                tac.mark_consumed(judg.get("decision_id"), t)
                 if TRACE and (judg.get("maneuver"), judg.get("source")) != prev:
                     print("  t=%5.1f %-11s p=%.2f risk=%.2f lost=%.2f | pos=(%.1f,%.1f,%.1f) blk=%d/5 near=%.2f tall=%s vis=%s"
                           % (t, judg["maneuver"], (judg.get("probabilities") or {}).get(judg["maneuver"], 0),
@@ -313,6 +374,8 @@ def episode(seed=0, seconds=35.0, use_jev=True, video=None, hz=None, budget=None
                           flush=True)
             v_des, yaw_cmd, acted, reflex = guide(scene, judg, yaw, pos[2], use_jev, fresh, t, pos)
             fresh = False
+            if tac and guide.veto:
+                tac.mark_veto(guide.veto_id, guide.veto)
             jev_steps += acted
             reflex_steps += reflex
 
@@ -347,7 +410,7 @@ def episode(seed=0, seconds=35.0, use_jev=True, video=None, hz=None, budget=None
             depth = np.clip(eye.depth.render(), 0, 25.0)
             tel = {"t": t, "standoff": standoffs[-1], "speed": float(np.linalg.norm(d.qvel[:3])),
                    "hits": hits, "model": tac.model if tac else "disabled",
-                   "mode": "JEV ENGAGED" if use_jev else "ABLATION: NO JEV",
+                   "mode": f"{provider.upper()} ENGAGED" if use_jev else "ABLATION: NO MODEL",
                    "calls": tac.calls if tac else 0, "skipped": tac.skipped if tac else 0,
                    "tokens": tac.tokens if tac else 0, "hz": (1.0 / tac.min_dt) if tac else 0,
                    "lat": f"{np.median(tac.latency):.2f}s" if (tac and tac.latency) else "--",
@@ -369,9 +432,22 @@ def episode(seed=0, seconds=35.0, use_jev=True, video=None, hz=None, budget=None
            "steps_jev_acted_pct": round(100 * jev_steps / (n / 10), 1),
            "steps_reflex_pct": round(100 * reflex_steps / (n / 10), 1),
            "max_x_m": round(max_x, 1), "crossed_barrier": crossed, "crashed_at_s": crashed_at, "flew_s": round(len(standoffs) * dt, 1)}
+    cleared = [name for name, x in STATIONS_X if max_x > x]
+    out.update(decision_provider=provider if use_jev else "heuristic",
+               edge_profile=(profile or {}).get("name"), realtime=realtime,
+               stations_cleared=cleared, course_completion=round(len(cleared) / len(STATIONS_X), 2),
+               course_completed=len(cleared) == len(STATIONS_X))
     if tac:
-        out["jev"] = tac.stats()
         tac.close()
+        out["decisions"] = tac.stats()
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+            path = os.path.join(log_dir, f"decisions_{provider}_seed{seed}.jsonl")
+            with open(path, "w") as f:
+                for rec in tac.records:
+                    f.write(json.dumps(rec) + "\n")
+    if monitor:
+        out["resources"] = monitor.stop()
     return out
 
 
@@ -379,13 +455,33 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--seeds", type=int, nargs="+", default=[0])
     p.add_argument("--seconds", type=float, default=35.0)
-    p.add_argument("--no-jev", action="store_true")
+    p.add_argument("--no-jev", action="store_true", help="alias of --decision-provider heuristic")
+    p.add_argument("--decision-provider", choices=("laya", "jev", "heuristic"), default="laya",
+                   help="laya = local onboard service (default); jev = TypeSafe cloud (legacy); "
+                        "heuristic = no model, the original ablation")
+    p.add_argument("--edge-profile", default=None, help="see edge_profiles.yaml")
     p.add_argument("--video", default=None)
-    p.add_argument("--hz", type=float, default=None)
+    p.add_argument("--decision-hz", "--hz", dest="hz", type=float, default=None)
     p.add_argument("--budget", type=int, default=None)
-    p.add_argument("--fast", action="store_true", help="run faster than real time (unfair to Jev)")
+    p.add_argument("--log-dir", default=None, help="write per-decision JSONL here")
+    p.add_argument("--gpu-idle-mb", type=float, default=None,
+                   help="GPU memory used with the model NOT loaded, to report the model's share")
+    p.add_argument("--fast", action="store_true", help="run faster than real time (unfair to the model)")
     a = p.parse_args()
+    use_model = not a.no_jev and a.decision_provider != "heuristic"
+    prof = None
+    if a.edge_profile:
+        import edge
+        prof = edge.load_profile(a.edge_profile)
+        if use_model:
+            edge.check_container(prof)
+    realtime = not a.fast
+    if prof and prof.get("realtime_simulation") and use_model and a.fast:
+        print("[edge] profile requires realtime simulation; ignoring --fast", flush=True)
+        realtime = True
     for s in a.seeds:
-        r = episode(s, a.seconds, not a.no_jev, a.video, a.hz, a.budget, realtime=not a.fast)
+        r = episode(s, a.seconds, use_model, a.video, a.hz, a.budget, realtime=realtime,
+                    provider=a.decision_provider, profile=prof, log_dir=a.log_dir,
+                    gpu_idle_mb=a.gpu_idle_mb)
         print(json.dumps(r))
         sys.stdout.flush()

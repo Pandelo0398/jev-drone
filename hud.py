@@ -72,7 +72,7 @@ class Hud:
         dr.rectangle([px, 0, self.W, self.H], fill=PANEL)
         dr.line([px, 0, px, self.H], fill=LINE, width=1)
         x0, w = px + 22, self.W_PANEL - 44
-        fresh = judg.get("age_s", 9) < 0.45 and judg["source"] == "jev"
+        fresh = judg.get("age_s", 9) < 0.45 and judg.get("from_model", judg["source"] == "jev")
 
         # ---- header ------------------------------------------------------
         y = 26
@@ -132,7 +132,7 @@ class Hud:
         # ---- the judgment -------------------------------------------------
         y += 16
         dr.text((x0, y), "TACTICAL JUDGMENT", font=font(11, True), fill=ACCENT)
-        if judg["source"] != "jev":
+        if not judg.get("from_model", judg["source"] == "jev"):
             dr.text((x0 + w - 62, y), "FALLBACK", font=font(11, True), fill=DIM)
         y += 22
         if "steer" in judg:                       # graded-score navigator
@@ -161,7 +161,7 @@ class Hud:
             p = probs.get(k, 0.0)
             self.smooth[k] = 0.65 * self.smooth.get(k, 0.0) + 0.35 * p   # ease the bars
             p = self.smooth[k]
-            chosen = k == judg["maneuver"] and judg["source"] == "jev"
+            chosen = k == judg["maneuver"] and judg.get("from_model", judg["source"] == "jev")
             col = ACCENT if chosen else (58, 70, 82)
             dr.text((x0, y), k.replace("_", " ").ljust(11), font=font(12, True if chosen else False),
                     fill=TEXT if chosen else DIM)
@@ -202,7 +202,7 @@ class Hud:
                     fill=RED if (k == "CONTACTS" and tel["hits"]) else TEXT)
             cx += 150
         dr.text((self.vw - 330, self.vh - 36), tel["mode"], font=font(14, True),
-                fill=ACCENT if tel["mode"].startswith("JEV") else DIM)
+                fill=DIM if tel["mode"].startswith("ABLATION") else ACCENT)
         if tel.get("climbing"):
             dr.text((self.vw - 330, self.vh - 52), "CLIMBING OVER BARRIER", font=font(11, True), fill=GREEN)
         return np.asarray(img.convert("RGB"))

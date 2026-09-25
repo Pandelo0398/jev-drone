@@ -1,4 +1,4 @@
-"""Jev tactical layer: the drone's programmable common sense.
+"""Tactical layer: the drone's programmable common sense.
 
 Everything a human should review lives at the top of this file: the questions,
 the option rubrics, and the thresholds. Nothing else in the project hard-codes a
@@ -6,12 +6,12 @@ number that changes how the aircraft reacts to a judgment.
 
 Runs off the control loop in a worker thread. The flight code never blocks on it
 and never *needs* it -- it reads whatever judgment is currently cached, and the
-reflex layer in run.py owns safety regardless of what comes back.
-"""
-import os, threading, queue, time
-from typesafe_sdk import TypeSafeClient, Choice, Noul, Score
+safety gate + reflex (safety.py, run.py) own safety regardless of what comes back.
 
-MODEL = "jev-latest"
+Which model answers is not decided here: see providers.py (Laya local, Jev legacy).
+"""
+import asyncio, threading, time
+import numpy as np
 
 # --- how the flight code reacts to a judgment -------------------------------
 THRESHOLDS = {
@@ -64,27 +64,32 @@ MANEUVERS = {
         "stale. Stop chasing it and sweep to find the target again."),
 }
 
+# Plain SystemOne wire format, so any provider can take it as-is. Byte-for-byte the
+# same JSON the TypeSafe SDK used to send for the original Choice/Score/Noul objects.
 QUESTIONS = {
-    "maneuver": Choice(
-        instructions={
+    "maneuver": {
+        "type": "choice",
+        "instructions": {
             "role": "You are the tactical decision layer of an autonomous quadrotor.",
             "mission": MISSION,
             "ask": "Which single maneuver should the drone commit to right now?",
         },
-        criteria=MANEUVERS,
-    ),
-    "risk": Score(
-        instructions="How dangerous is the drone's immediate situation?",
-        criteria=["clear and open", "tight but manageable", "about to hit something"],
-    ),
-    "target_truly_lost": Noul(
-        instructions=(
+        "criteria": MANEUVERS,
+    },
+    "risk": {
+        "type": "score",
+        "instructions": "How dangerous is the drone's immediate situation?",
+        "criteria": ["clear and open", "tight but manageable", "about to hit something"],
+    },
+    "target_truly_lost": {
+        "type": "noul",
+        "instructions": (
             "Has the drone genuinely lost the rover? Judge from unseen_for_s: a fraction "
             "of a second behind a pillar is a normal occlusion, several seconds of nothing "
             "in an open scene means the chase line is stale."),
-        criteria={"true": "Give up the remembered bearing and sweep to search.",
-                  "false": "Keep flying the last known bearing; it should reappear."},
-    ),
+        "criteria": {"true": "Give up the remembered bearing and sweep to search.",
+                     "false": "Keep flying the last known bearing; it should reappear."},
+    },
 }
 
 
@@ -103,35 +108,68 @@ def build_state(scene):
 
 DEFAULT = {"maneuver": "hold_course", "risk": 0.0, "confidence": 0.0,
            "target_truly_lost": 0.0, "source": "default", "age_s": 0.0,
-           "probabilities": {}}
+           "probabilities": {}, "from_model": False, "decision_id": None}
+
+
+def to_judgment(resp, source):
+    """Typed answers -> the judgment dict guidance reads. Provider-agnostic."""
+    a = resp.answers
+    return {
+        "maneuver": a["maneuver"].choice,
+        "confidence": round(a["maneuver"].confidence or 0.0, 3),
+        "probabilities": {k: round(v, 3) for k, v in a["maneuver"].probabilities.items()},
+        "risk": round(a["risk"].score, 2),
+        "target_truly_lost": round(a["target_truly_lost"].noul, 3),
+        "source": source,
+        "from_model": True,
+    }
+
+
+def _pct(xs, q):
+    return round(float(np.percentile(xs, q)), 1) if xs else None
 
 
 class Tactician:
-    """Asks Jev for a judgment at most `hz` times a second, and only when the
-    scene has actually changed enough to be worth a call."""
+    """Asks a DecisionProvider for a judgment at most `hz` times a second, and only
+    when the scene has actually changed enough to be worth a call.
 
-    def __init__(self, hz=THRESHOLDS["call_hz"], budget=THRESHOLDS["call_budget"], model=MODEL):
-        key = os.environ.get("TYPESAFE_API_KEY") or os.environ.get("JEV_API_KEY")
-        if not key:
-            raise RuntimeError("set TYPESAFE_API_KEY (see .env.example)")
-        self.client = TypeSafeClient(api_key=key)
+    Timing is honest: a judgment becomes visible to guidance only when the answer
+    actually comes back. At most one request is in flight and at most one is waiting;
+    a newer scene replaces a waiting one (latest-state-wins), so there is no queue to
+    build up. An answer older than `deadline_s` (state -> available, sim time) is
+    discarded as late and the previous judgment keeps ageing.
+
+    `now` is the simulation clock, advanced by the episode loop; all per-decision
+    timestamps are in sim time, inference latency is wall-clock.
+    """
+
+    def __init__(self, provider, hz=THRESHOLDS["call_hz"], budget=THRESHOLDS["call_budget"],
+                 deadline_s=None, timeout_s=2.0):
+        self.provider = provider
+        self.model = f"{provider.name}:{provider.model}"
         self.min_dt = 1.0 / hz
-        self.budget = budget
-        self.model = model
+        self.budget = budget                      # None = unlimited
+        self.deadline_s = deadline_s
+        self.timeout_s = timeout_s
+        self.now = 0.0
         self.calls = 0
         self.attempts = 0
         self.skipped = 0
         self.errors = 0
         self.n_offer = 0
         self.n_ratelimited = 0
-        self.n_full = 0
+        self.n_superseded = 0
+        self.n_late = 0
         self.last_error = None
         self.tokens = 0
-        self.latency = []
-        self._q = queue.Queue(maxsize=1)
+        self.latency = []                         # wall-clock seconds per completed call
+        self.records = []                         # one dict per requested decision
+        self.veto_reasons = {}
         self._latest = dict(DEFAULT)
         self._stamp = 0.0
         self._lock = threading.Lock()
+        self._cv = threading.Condition()
+        self._pending = None                      # (decision_id, scene, t_state)
         self._last_sent = float("-inf")
         self._last_key = None
         self._stop = threading.Event()
@@ -155,18 +193,24 @@ class Tactician:
     def offer(self, scene, now):
         """Non-blocking. Hand the latest scene over if it's worth a call."""
         self.n_offer += 1
-        if self.attempts >= self.budget or now - self._last_sent < self.min_dt:
+        if (self.budget is not None and self.attempts >= self.budget) or now - self._last_sent < self.min_dt:
             self.n_ratelimited += 1
             return
         key = self._key(scene)
         if key == self._last_key:
             self.skipped += 1
             return
-        try:
-            self._q.put_nowait((scene, now))
-            self._last_sent, self._last_key = now, key
-        except queue.Full:
-            self.n_full += 1
+        with self._lock:
+            did = len(self.records)
+            self.records.append({"decision_id": did, "timestamp": round(now, 3), "status": "pending",
+                                 "safety_veto": False, "safety_veto_reason": None})
+        with self._cv:
+            if self._pending is not None:         # latest-state-wins
+                self.records[self._pending[0]]["status"] = "superseded"
+                self.n_superseded += 1
+            self._pending = (did, scene, now)
+            self._cv.notify()
+        self._last_sent, self._last_key = now, key
 
     def read(self, now):
         with self._lock:
@@ -174,52 +218,107 @@ class Tactician:
         out["age_s"] = round(now - self._stamp, 2)
         return out
 
+    def mark_consumed(self, decision_id, now):
+        """Guidance has acted on this judgment for the first time."""
+        if decision_id is None:
+            return
+        rec = self.records[decision_id]
+        if "end_to_end_latency_ms" not in rec:
+            rec["end_to_end_latency_ms"] = round(1000 * (now - rec["timestamp"]), 1)
+
+    def mark_veto(self, decision_id, reason):
+        if decision_id is None:
+            return
+        rec = self.records[decision_id]
+        if not rec["safety_veto"]:
+            rec["safety_veto"], rec["safety_veto_reason"] = True, reason
+            self.veto_reasons[reason] = self.veto_reasons.get(reason, 0) + 1
+
+    def _take(self):
+        with self._cv:
+            while self._pending is None and not self._stop.is_set():
+                self._cv.wait(timeout=0.2)
+            job, self._pending = self._pending, None
+            return job
+
     def _worker(self):
-        while not self._stop.is_set():
+        loop = asyncio.new_event_loop()
+        try:
+            while not self._stop.is_set():
+                job = self._take()
+                if job is None:
+                    continue
+                did, scene, t_state = job
+                rec = self.records[did]
+                self.attempts += 1  # counts against the budget whether or not the call succeeds
+                t0 = time.perf_counter()
+                try:
+                    r = loop.run_until_complete(asyncio.wait_for(
+                        self.provider.predict(build_state(scene), QUESTIONS), self.timeout_s))
+                    lat = time.perf_counter() - t0
+                    judgment = to_judgment(r, self.provider.name)
+                    judgment["decision_id"] = did
+                    age = self.now - t_state
+                    self.tokens += r.input_tokens + r.output_tokens
+                    self.latency.append(lat)
+                    rec.update(inference_latency_ms=round(1000 * lat, 1),
+                               state_age_ms=round(1000 * age, 1),
+                               maneuver=judgment["maneuver"],
+                               maneuver_probability=judgment["probabilities"].get(judgment["maneuver"]),
+                               confidence=judgment["confidence"],
+                               risk=judgment["risk"],
+                               target_lost_probability=judgment["target_truly_lost"])
+                    if self.deadline_s is not None and age > self.deadline_s:
+                        rec["status"] = "late"             # missed the onboard budget
+                        self.n_late += 1
+                        continue
+                    rec["status"] = "completed"
+                    self.calls += 1
+                    with self._lock:
+                        self._latest, self._stamp = judgment, t_state
+                except Exception as e:                    # degrade, never crash the flight
+                    self.errors += 1
+                    self.last_error = f"{type(e).__name__}: {e}"[:160]
+                    rec["status"] = "error"
+                    rec["error"] = self.last_error
+                    # A failed call replaces the cached judgment with an error placeholder, so the
+                    # next offer() for this same scene must not be skipped as "unchanged" - otherwise
+                    # a static scene never gets re-asked and never recovers a real judgment.
+                    self._last_key = None
+                    with self._lock:
+                        self._latest = dict(DEFAULT, source=f"error:{type(e).__name__}")
+        finally:
             try:
-                scene, now = self._q.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            t0 = time.time()
-            self.attempts += 1  # counts against the budget whether or not the call succeeds
-            try:
-                r = self.client.system_one(state=build_state(scene), model=self.model, questions=QUESTIONS)
-                a = r.answers
-                judgment = {
-                    "maneuver": a["maneuver"].choice,
-                    "confidence": round(a["maneuver"].confidence, 3),
-                    "probabilities": {k: round(v, 3) for k, v in a["maneuver"].probabilities.items()},
-                    "risk": round(a["risk"].score, 2),
-                    "target_truly_lost": round(a["target_truly_lost"].noul, 3),
-                    "source": "jev",
-                }
-                self.tokens += r.usage.input_tokens + r.usage.output_tokens
-                self.calls += 1
-                self.latency.append(time.time() - t0)
-                with self._lock:
-                    self._latest, self._stamp = judgment, now
-            except Exception as e:                    # degrade, never crash the flight
-                self.errors += 1
-                self.last_error = f"{type(e).__name__}: {e}"[:160]
-                # A failed call replaces the cached judgment with an error placeholder, so the
-                # next offer() for this same scene must not be skipped as "unchanged" - otherwise
-                # a static scene never gets re-asked and never recovers a real judgment.
-                self._last_key = None
-                with self._lock:
-                    self._latest = dict(DEFAULT, source=f"error:{type(e).__name__}")
+                loop.run_until_complete(self.provider.aclose())
+            except Exception:
+                pass
+            loop.close()
 
     def close(self):
         self._stop.set()
-        self._thread.join(timeout=1.0)
-        try:
-            self.client.close()
-        except Exception:
-            pass
+        with self._cv:
+            self._cv.notify()
+        self._thread.join(timeout=self.timeout_s + 1.0)
 
     def stats(self):
-        lat = sorted(self.latency)
-        return {"calls": self.calls, "attempts": self.attempts, "skipped_unchanged": self.skipped, "errors": self.errors,
-                "last_error": self.last_error, "tokens": self.tokens,
-                "offers": self.n_offer, "rate_limited": self.n_ratelimited, "queue_full": self.n_full,
-                "median_latency_s": round(lat[len(lat) // 2], 3) if lat else None,
-                "p90_latency_s": round(lat[int(len(lat) * 0.9)], 3) if lat else None}
+        lat_ms = [1000 * x for x in self.latency]
+        done = [r for r in self.records if r["status"] == "completed"]
+        e2e = [r["end_to_end_latency_ms"] for r in done if "end_to_end_latency_ms" in r]
+        age = [r["state_age_ms"] for r in done]
+        conf = [r["maneuver_probability"] for r in done if r.get("maneuver_probability") is not None]
+        vetoed = sum(r["safety_veto"] for r in self.records)
+        return {"provider": self.provider.name, "model": self.provider.model,
+                "decisions_requested": len(self.records),
+                "decisions_completed": self.calls,
+                "decisions_dropped": self.n_superseded + self.n_late + self.errors,
+                "dropped_superseded": self.n_superseded, "dropped_late": self.n_late,
+                "errors": self.errors, "last_error": self.last_error,
+                "skipped_unchanged": self.skipped, "rate_limited": self.n_ratelimited,
+                "offers": self.n_offer, "tokens": self.tokens,
+                "latency_p50_ms": _pct(lat_ms, 50), "latency_p90_ms": _pct(lat_ms, 90),
+                "latency_p99_ms": _pct(lat_ms, 99),
+                "state_age_p50_ms": _pct(age, 50), "state_age_p99_ms": _pct(age, 99),
+                "end_to_end_p50_ms": _pct(e2e, 50), "end_to_end_p99_ms": _pct(e2e, 99),
+                "maneuver_probability_mean": round(float(np.mean(conf)), 3) if conf else None,
+                "unsafe_decisions_proposed": vetoed, "unsafe_decisions_vetoed": vetoed,
+                "veto_reasons": dict(self.veto_reasons)}

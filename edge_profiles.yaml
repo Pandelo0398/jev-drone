@@ -1,0 +1,45 @@
+# Onboard execution profiles.
+#
+# A profile describes the ENVELOPE the decision model must live inside when it is
+# treated as an onboard computer: how often it may be asked, how late an answer may
+# arrive before it is useless, what network it may reach, and the CPU/RAM limits of
+# the container it runs in (applied by docker-compose.onboard.yml, checked at start).
+#
+# "_like" is deliberate. This does NOT emulate Jetson silicon: the model still runs on
+# the host GPU (an RTX 4070 Laptop here), whose throughput is far above an Orin Nano's.
+# What is emulated is isolation, resource limits, rate, deadline, local-only network,
+# offline operation and asynchronous edge timing.
+edge_profiles:
+
+  jetson_orin_nano_like:
+    description: >-
+      Envelope of an 8 GB Jetson Orin Nano class module: 6 CPU cores, 8 GB of memory
+      (on a real Orin this is unified CPU+GPU memory, so container RAM + model VRAM
+      are reported together against it), batch 1, local-only network.
+    cpu_cores: 6
+    ram_gb: 8
+    decision_hz: 5
+    network_mode: local_only          # refuse cloud providers and non-local endpoints
+    max_decision_latency_ms: 200      # state -> answer available; later answers are dropped
+    realtime_simulation: true         # sim is paced to wall-clock so latency is real
+    batch_size: 1
+    max_inflight: 1                   # one request in flight, one waiting (latest-state-wins)
+    inference_budget: null            # max calls per episode; null = limited by decision_hz only
+    laya_url: http://localhost:8000
+    laya_model: laya-english
+    container: laya-onboard
+
+  workstation:
+    description: Unconstrained host run, for comparison with the edge envelope.
+    cpu_cores: null
+    ram_gb: null
+    decision_hz: 3
+    network_mode: any
+    max_decision_latency_ms: null
+    realtime_simulation: true
+    batch_size: 1
+    max_inflight: 1
+    inference_budget: null
+    laya_url: http://localhost:8000
+    laya_model: laya-english
+    container: laya-onboard
